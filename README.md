@@ -74,7 +74,8 @@ Runtime: `sandboxIsolationDemo-COIZYqEK2d` (us-east-1)
 │   ├── create-runtime.sh
 │   └── update_runtime_efs.py   # 添加 EFS 到 Runtime (raw API)
 └── tests/
-    └── test_e2e.py             # 本地单元测试
+    ├── test_e2e.py             # 本地单元测试
+    └── test_agentcore_live.py  # AWS 线上验证测试 (17 项)
 ```
 
 ## 部署步骤
@@ -132,16 +133,48 @@ python3 infra/update_runtime_efs.py
 }
 ```
 
-### 4. 调用测试
+### 4. 运行验证测试
 
-```python
-# 使用 MCP tool 或 boto3
-payload = {
-    "tenant_id": "tenant-A",
-    "action": "run_command",
-    "params": {"command": "ls /workspace/"}
-}
-# → 只看到 tenant-A 的 input/ output/
+```bash
+python3 tests/test_agentcore_live.py
+```
+
+测试覆盖 17 项场景，全部通过：
+
+```
+━━━ Test 1: EFS 挂载验证 ━━━
+  ✅ PASS: EFS /mnt/shared 可访问
+━━━ Test 2: Workspace bind mount 隔离 ━━━
+  ✅ PASS: /workspace 存在且有内容
+  ✅ PASS: isolated = true (bind mount 生效)
+━━━ Test 3: Tenant-A 写入文件 ━━━
+  ✅ PASS: 写入成功
+━━━ Test 4: Tenant-A 读取自己的文件 ━━━
+  ✅ PASS: 读取内容正确
+━━━ Test 5: Tenant-A 路径遍历攻击 (../tenant-B/) ━━━
+  ✅ PASS: 阻止: ../tenant-B/output/secret_B.txt
+  ✅ PASS: 阻止: ../../tenants/tenant-B/output/secret_B.txt
+  ✅ PASS: 阻止: output/../../../etc/passwd
+━━━ Test 6: Tenant-B 独立 session 写入 ━━━
+  ✅ PASS: Tenant-B 写入成功
+━━━ Test 7: Tenant-B 路径遍历访问 Tenant-A ━━━
+  ✅ PASS: Tenant-B 无法访问 Tenant-A
+━━━ Test 8: Tenant-B 读取自己的文件 ━━━
+  ✅ PASS: Tenant-B 读取自己文件成功
+━━━ Test 9: 同一 Session 切换租户 (应被拒绝) ━━━
+  ✅ PASS: 切换租户被拒绝 (PERMISSION_DENIED)
+━━━ Test 10: Python 代码执行验证 ━━━
+  ✅ PASS: 代码执行成功
+  ✅ PASS: 运行在 /workspace (bind mount)
+  ✅ PASS: workspace 包含 input/output
+━━━ Test 11: 列目录验证 ━━━
+  ✅ PASS: list_files 返回文件列表
+━━━ Test 12: list_files 路径遍历防护 ━━━
+  ✅ PASS: list_files 路径遍历被阻止
+
+============================================================
+  结果: 17 passed, 0 failed, 17 total
+============================================================
 ```
 
 ## 使用方式（业务 Pod 侧）
