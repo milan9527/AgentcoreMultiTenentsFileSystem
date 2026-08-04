@@ -1,35 +1,46 @@
 """
-WorkspaceGuard - 租户目录隔离
+WorkspaceGuard - 租户目录解析与路径守卫
 
-在 AgentCore Runtime 的 /invocation 入口中：
-1. 根据 payload 中的 tenant_id 确定租户子目录
-2. 通过 bind mount 将租户子目录映射到 /workspace
-3. 后续所有操作限制在 /workspace 内
+职责（相对旧版已收窄）：
+1. 确定租户在 EFS 上的目录，确保目录结构存在
+2. 为受守卫的文件 API (read_file/write_file/list_files) 提供安全路径解析
 
-隔离原理：
-- AgentCore 每个 session 是独立 microVM → session 间天然隔离
-- 本模块解决的是：限制 session 内可见的 EFS 数据范围
+**不再**负责把租户目录 bind mount 到 /workspace。原因：bind mount 只把租户
+目录 *映射* 到 /workspace，并没有 *隐藏* /mnt/shared —— 租户代码用绝对路径
+/mnt/shared/tenants/<其他租户> 可以直接读写。文件系统视图的隔离改由
+jail.py 用 mount namespace + pivot_root 实现，那里 /mnt/shared 根本不存在。
 
-注意：
-- AgentCore microVM 内容器通常以 root 运行
-- bind mount 需要 root 权限（或 unshare --mount）
-- 如果 bind mount 不可用，退化为应用层路径限制
+本模块因此只做两件事：目录管理 + 路径解析。所有租户代码执行都必须走 jail。
+
+路径守卫相对旧版的三处修正：
+- 绝对路径不再被静默改写。旧版 lstrip("/") 把 "/etc/passwd" 变成
+  workspace/etc/passwd 并返回成功，既在租户目录里种出影子目录树，也把明显的
+  越权尝试伪装成正常操作，审计日志里看不到。现在直接拒绝。
+- symlink 逃逸：解析父目录的真实路径，租户自己种下的 symlink 无法指向外部。
+- 不再有 rmtree/symlink 退化逻辑。旧版在 bind mount 失败时 rmtree(WORKSPACE)，
+  若 /workspace 上残留着上一个租户的活动 bind mount，会穿过挂载点删除该租户
+  在 EFS 上的真实数据。该代码路径已整体移除。
 """
 
-import os
-import subprocess
 import logging
-from pathlib import Path
-from typing import Optional
+import os
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Optional
+
+from tenant_identity import is_valid_tenant_id
 
 logger = logging.getLogger(__name__)
 
-# AgentCore 挂载 EFS 的路径 (通过 filesystemConfigurations 配置)
-EFS_MOUNT = "/mnt/shared"
-TENANTS_DIR = f"{EFS_MOUNT}/tenants"
+# AgentCore 挂载 EFS 的路径 (通过 filesystemConfigurations 的 mountPath 配置)
+EFS_MOUNT = os.environ.get("EFS_MOUNT", "/mnt/shared")
 
-# session 内暴露给 agent 的工作目录
+# 租户目录的父目录。
+# 若 EFS Access Point 的 root directory 已经是 /tenants（见 infra/setup-efs.sh），
+# 则挂载点本身就是 tenants 目录，此时应设 TENANTS_DIR=/mnt/shared。
+TENANTS_DIR = os.environ.get("TENANTS_DIR") or os.path.join(EFS_MOUNT, "tenants")
+
+# jail 内暴露给租户代码的工作目录路径
 WORKSPACE = "/workspace"
 
 
@@ -38,162 +49,117 @@ class TenantWorkspace:
     """租户工作空间"""
     tenant_id: str
     efs_tenant_path: str   # EFS 上的实际路径: /mnt/shared/tenants/{tenant_id}
-    workspace_path: str     # session 内暴露的路径: /workspace
-    input_path: str         # /workspace/input
-    output_path: str        # /workspace/output
-    isolated: bool          # 是否成功建立隔离 (bind mount)
+    workspace_path: str    # jail 内暴露的路径: /workspace
+    input_path: str        # /workspace/input
+    output_path: str       # /workspace/output
+
+
+class PathNotAllowed(Exception):
+    """路径越界 —— 操作必须被拒绝"""
 
 
 class WorkspaceGuard:
-    """
-    租户工作空间隔离器
+    """租户目录解析器 + 路径守卫"""
 
-    每个 AgentCore session 启动时调用一次 setup()，
-    将该 session 的可见范围限制到指定租户的子目录。
-    """
-
-    def __init__(self, efs_mount: str = EFS_MOUNT):
+    def __init__(self, efs_mount: str = EFS_MOUNT, tenants_dir: Optional[str] = None):
         self.efs_mount = efs_mount
-        self.tenants_dir = f"{efs_mount}/tenants"
-        self._current_tenant: Optional[TenantWorkspace] = None
+        if tenants_dir:
+            self.tenants_dir = tenants_dir
+        elif efs_mount == EFS_MOUNT:
+            self.tenants_dir = TENANTS_DIR
+        else:
+            self.tenants_dir = os.path.join(efs_mount, "tenants")
+
+    # ─── 目录管理 ────────────────────────────────────────────────
 
     def setup(self, tenant_id: str) -> TenantWorkspace:
         """
-        为 session 设置租户工作空间
+        确保租户目录就绪，返回描述。
 
-        流程：
-        1. 确保租户目录存在
-        2. 尝试 bind mount 到 /workspace (最强隔离)
-        3. 如果 bind mount 失败，退化为 symlink + 路径守卫
+        不做任何 mount —— 文件系统隔离由 jail.py 负责。
 
-        Args:
-            tenant_id: 租户标识
-
-        Returns:
-            TenantWorkspace 描述
+        Raises:
+            ValueError: tenant_id 非法
         """
-        # 验证 tenant_id 安全性（防止路径注入）
-        if not self._is_safe_tenant_id(tenant_id):
-            raise ValueError(f"Invalid tenant_id: {tenant_id}")
+        if not is_valid_tenant_id(tenant_id):
+            raise ValueError(f"Invalid tenant_id: {tenant_id!r}")
 
-        # 租户目录路径
         tenant_path = os.path.join(self.tenants_dir, tenant_id)
 
-        # 确保目录结构
-        self._ensure_tenant_dirs(tenant_path)
+        # 防御性检查：即使 tenant_id 校验被绕过，也不允许目录跑到 tenants_dir 之外
+        real_tenants = os.path.realpath(self.tenants_dir)
+        if os.path.dirname(os.path.realpath(tenant_path)) != real_tenants:
+            raise ValueError(f"Tenant path escapes tenants dir: {tenant_id!r}")
 
-        # 尝试建立隔离
-        isolated = self._setup_isolation(tenant_path)
+        os.makedirs(tenant_path, mode=0o700, exist_ok=True)
+        for sub in ("input", "output"):
+            os.makedirs(os.path.join(tenant_path, sub), mode=0o700, exist_ok=True)
 
-        workspace = TenantWorkspace(
+        logger.info("Workspace ready: tenant=%s", tenant_id)
+        return TenantWorkspace(
             tenant_id=tenant_id,
             efs_tenant_path=tenant_path,
             workspace_path=WORKSPACE,
             input_path=f"{WORKSPACE}/input",
             output_path=f"{WORKSPACE}/output",
-            isolated=isolated,
         )
 
-        self._current_tenant = workspace
-        logger.info(
-            f"Workspace ready: tenant={tenant_id}, "
-            f"isolated={isolated}, path={WORKSPACE}"
-        )
-        return workspace
+    # ─── 路径守卫 ────────────────────────────────────────────────
 
-    def _is_safe_tenant_id(self, tenant_id: str) -> bool:
-        """验证 tenant_id 不含路径注入字符"""
-        if not tenant_id:
-            return False
-        # 只允许字母数字和 - _
-        import re
-        return bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}$', tenant_id))
-
-    def _ensure_tenant_dirs(self, tenant_path: str):
-        """创建租户目录结构"""
-        os.makedirs(tenant_path, mode=0o755, exist_ok=True)
-        os.makedirs(f"{tenant_path}/input", mode=0o755, exist_ok=True)
-        os.makedirs(f"{tenant_path}/output", mode=0o755, exist_ok=True)
-
-    def _setup_isolation(self, tenant_path: str) -> bool:
+    def resolve_path(self, workspace: TenantWorkspace, relative_path: str,
+                     for_write: bool = False) -> str:
         """
-        建立隔离：优先 bind mount，退化为 symlink
-
-        Returns:
-            True = bind mount 成功 (强隔离)
-            False = 退化为 symlink (弱隔离，依赖路径守卫)
-        """
-        os.makedirs(WORKSPACE, exist_ok=True)
-
-        # 尝试 bind mount
-        if self._try_bind_mount(tenant_path):
-            return True
-
-        # 退化：symlink
-        logger.warning("Bind mount unavailable, falling back to symlink + path guard")
-        self._setup_symlink(tenant_path)
-        return False
-
-    def _try_bind_mount(self, tenant_path: str) -> bool:
-        """尝试 bind mount"""
-        try:
-            result = subprocess.run(
-                ["mount", "--bind", tenant_path, WORKSPACE],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                logger.info(f"Bind mount: {tenant_path} → {WORKSPACE}")
-                return True
-            else:
-                logger.warning(f"Bind mount failed (rc={result.returncode}): {result.stderr.strip()}")
-                return False
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
-            logger.warning(f"Bind mount not available: {e}")
-            return False
-
-    def _setup_symlink(self, tenant_path: str):
-        """退化方案：symlink"""
-        # 清理旧的
-        if os.path.islink(WORKSPACE):
-            os.unlink(WORKSPACE)
-        elif os.path.isdir(WORKSPACE):
-            # 如果已经是目录（可能之前 bind mount 过），清空
-            import shutil
-            shutil.rmtree(WORKSPACE)
-
-        os.symlink(tenant_path, WORKSPACE)
-        logger.info(f"Symlink: {WORKSPACE} → {tenant_path}")
-
-    def resolve_path(self, relative_path: str) -> Optional[str]:
-        """
-        安全解析路径，确保不逃逸出 workspace
+        把 workspace 相对路径解析为 EFS 上的真实路径。
 
         Args:
-            relative_path: 相对于 /workspace 的路径
+            workspace: 当前 session 绑定的租户工作空间
+            relative_path: 相对于 /workspace 的路径；绝对路径一律拒绝
+            for_write: 写操作时允许目标文件尚不存在
 
         Returns:
-            解析后的安全路径，逃逸则返回 None
+            EFS 上的绝对路径，保证位于租户目录内
+
+        Raises:
+            PathNotAllowed: 越界、绝对路径、symlink 逃逸、非法路径
         """
-        if self._current_tenant is None:
-            return None
+        if not isinstance(relative_path, str) or not relative_path:
+            raise PathNotAllowed("Empty path")
 
-        # 清理路径
-        clean = relative_path.lstrip("/")
-        resolved = Path(WORKSPACE).joinpath(clean).resolve()
+        if "\x00" in relative_path:
+            raise PathNotAllowed("Path contains NUL byte")
 
-        # 如果是 bind mount，resolved 就在 /workspace 下
-        # 如果是 symlink，resolved 会指向实际的 tenant_path
-        workspace_real = Path(WORKSPACE).resolve()
+        # 绝对路径直接拒绝，不做静默改写
+        if relative_path.startswith("/"):
+            raise PathNotAllowed("Absolute paths are not allowed; use a workspace-relative path")
 
+        # 纯字面量层面先拒明显的向上遍历，便于审计日志留痕
+        parts = PurePosixPath(relative_path).parts
+        if any(p == ".." for p in parts):
+            raise PathNotAllowed("Parent directory traversal is not allowed")
+
+        tenant_root = Path(os.path.realpath(workspace.efs_tenant_path))
+        target = tenant_root.joinpath(relative_path)
+
+        # 逐级解析真实路径：租户可能在自己目录里种 symlink 指向外部。
+        # 对写操作，目标本身可以不存在，但其父目录必须已在租户目录内。
+        probe = target if target.exists() or not for_write else target.parent
         try:
-            resolved.relative_to(workspace_real)
-            return str(resolved)
-        except ValueError:
-            logger.warning(f"Path escape blocked: {relative_path} → {resolved}")
-            return None
+            real = Path(os.path.realpath(str(probe)))
+        except OSError as e:
+            raise PathNotAllowed(f"Cannot resolve path: {e.strerror}")
 
-    @property
-    def current_tenant(self) -> Optional[TenantWorkspace]:
-        return self._current_tenant
+        if real != tenant_root and tenant_root not in real.parents:
+            logger.warning("Path escape blocked: tenant=%s path=%r",
+                           workspace.tenant_id, relative_path)
+            raise PathNotAllowed("Path is outside the workspace")
+
+        # 已存在的路径若是 symlink，realpath 已经解到真实位置并通过了上面的检查；
+        # 但 symlink 本身指向租户目录外的情况在这里也被覆盖（real 会落在外部）。
+        resolved = real if probe is target else real / target.name
+        return str(resolved)
+
+    def to_workspace_view(self, workspace: TenantWorkspace, efs_path: str) -> str:
+        """把 EFS 真实路径转回租户看到的 /workspace 视图，避免向租户泄漏宿主路径"""
+        tenant_root = os.path.realpath(workspace.efs_tenant_path)
+        rel = os.path.relpath(efs_path, tenant_root)
+        return str(PurePosixPath(WORKSPACE) / rel) if rel != "." else WORKSPACE
