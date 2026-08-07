@@ -266,13 +266,27 @@ python3 tests/test_agentcore_live.py
 `InvokeAgentRuntime` → 一次 jail 内执行，你看到的文件系统就是那个租户
 在 jail 里看到的全部内容。
 
+依赖只有 boto3（`tests/test_agentcore_live.py` 同样）。注意 Amazon Linux 2023 的
+`/usr/bin/python3` **连 pip 都没装**，所以别照 `pip install boto3` 敲：
+
+```bash
+sudo dnf install -y python3-boto3     # AL2023 / RHEL 系
+sudo apt install -y python3-boto3     # Debian / Ubuntu
+# 或者不碰系统 python：
+python3 -m venv ~/.venv/agentcore && ~/.venv/agentcore/bin/pip install boto3
+```
+
 ```bash
 export RUNTIME_ID=sandboxIsolationDemo-xxxx AWS_REGION=us-east-1
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 ./tools/tenant_shell.py --tenant tenant-a           # 交互式
 ./tools/tenant_shell.py --tenant tenant-a --probe   # 一键隔离探测（13 项）
 ./tools/tenant_shell.py --tenant tenant-b -c 'ls /' # 单条命令后退出
 ```
+
+还需要一份能 `bedrock-agentcore:InvokeAgentRuntime` 的 AWS 凭证，以及签名密钥
+（未设 `TENANT_SIGNING_KEY` 时会自动从 Secrets Manager 取，见下）。
 
 指定 runtime 与 session：
 

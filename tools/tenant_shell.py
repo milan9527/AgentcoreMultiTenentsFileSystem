@@ -63,7 +63,22 @@ import uuid
 try:
     import boto3
 except ImportError:
-    sys.exit("boto3 required: pip install boto3")
+    # 光说 "pip install boto3" 不够用：Amazon Linux 2023 的 /usr/bin/python3 连 pip
+    # 都没装，照着敲只会再报一次 No module named pip。所以把三条路都给出来。
+    sys.exit(f"""boto3 未安装（当前解释器: {sys.executable}）
+
+按环境挑一条：
+
+  Amazon Linux 2023 / RHEL 系:
+    sudo dnf install -y python3-boto3
+
+  Debian / Ubuntu:
+    sudo apt install -y python3-boto3
+
+  不想碰系统 python 就用 venv（之后要用 venv 里的解释器来跑本脚本）:
+    python3 -m venv ~/.venv/agentcore
+    ~/.venv/agentcore/bin/pip install boto3
+    ~/.venv/agentcore/bin/python tools/tenant_shell.py --tenant tenant-a""")
 
 try:
     import readline  # noqa: F401  行编辑与历史

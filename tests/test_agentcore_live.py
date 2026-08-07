@@ -621,7 +621,10 @@ KEY_HELP = f"""\
 
 if __name__ == "__main__":
     if boto3 is None:
-        sys.exit("boto3 required: pip install boto3")
+        # AL2023 的系统 python 没有 pip，"pip install boto3" 会再报一次错
+        sys.exit(f"boto3 未安装（当前解释器: {sys.executable}）\n"
+                 f"  sudo dnf install -y python3-boto3     # AL2023 / RHEL\n"
+                 f"  sudo apt install -y python3-boto3     # Debian / Ubuntu")
 
     SIGNING_KEY, KEY_SOURCE = load_signing_key()
     if not SIGNING_KEY:
