@@ -128,6 +128,19 @@ def sign_tenant_token(tenant_id, signing_key, ttl_seconds=900):
     return f"{tenant_id}.{expiry}.{base64.urlsafe_b64encode(sig).decode().rstrip('=')}"
 
 
+def resolve_account(region):
+    """当前 AWS 身份所属账号。拿不到就直接退出 —— 没有凭证的话后面的
+    InvokeAgentRuntime 一样会失败，早报错比拼一个错 ARN 好。"""
+    try:
+        return boto3.client("sts", region_name=region).get_caller_identity()["Account"]
+    except Exception as e:
+        sys.exit(f"""无法确定 AWS 账号 id: {type(e).__name__}: {str(e)[:200]}
+
+配好 AWS 凭证（aws configure / 环境变量 / 实例角色），或显式指定：
+  export ACCOUNT_ID=<12 位账号 id>          # 或 --account <id>
+  export RUNTIME_ARN=arn:aws:bedrock-agentcore:...:runtime/xxx   # 或 --runtime-arn""")
+
+
 def load_signing_key(region, secret_id):
     """
     取签名密钥。优先 TENANT_SIGNING_KEY，否则从 Secrets Manager 拉 ——
@@ -682,8 +695,8 @@ def main():
                    help="Runtime id，与 --account/--region 拼成 ARN (env RUNTIME_ID)")
     p.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"),
                    help="AWS region (env AWS_REGION)")
-    p.add_argument("--account", default=os.environ.get("ACCOUNT_ID", "123456789012"),
-                   help="AWS 账号 id (env ACCOUNT_ID)")
+    p.add_argument("--account", default=os.environ.get("ACCOUNT_ID"),
+                   help="AWS 账号 id；不给就用当前 AWS 身份所属账号 (env ACCOUNT_ID)")
     p.add_argument("--secret-id",
                    default=os.environ.get("TENANT_SIGNING_KEY_SECRET_ID",
                                           "agentcore/tenant-signing-key"),
@@ -711,8 +724,14 @@ def main():
         if len(key) < 32:
             sys.exit(f"签名密钥太短（{len(key)} 字节，需 >= 32）—— 来源: {key_source}")
 
-    arn = args.runtime_arn or (f"arn:aws:bedrock-agentcore:{args.region}:{args.account}"
-                               f":runtime/{args.runtime_id}")
+    arn = args.runtime_arn
+    if not arn:
+        # 账号不能有"占位符默认值"：那样会拼出一个语法合法但指向别人账号的 ARN，
+        # 报错是 AccessDenied（看着像权限没配好），得自己盯着 ARN 才发现账号不对。
+        # 直接问 STS 要当前身份的账号 —— 反正调用 Runtime 也要这份凭证。
+        account = args.account or resolve_account(args.region)
+        arn = (f"arn:aws:bedrock-agentcore:{args.region}:{account}"
+               f":runtime/{args.runtime_id}")
     sh = TenantShell(arn, args.region, key, args.tenant,
                      session_id=args.session_id, timeout=args.timeout,
                      key_source=key_source)

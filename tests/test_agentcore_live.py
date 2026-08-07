@@ -69,8 +69,10 @@ except ImportError:  # pragma: no cover - 仅影响本地 discover
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 RUNTIME_ID = os.environ.get("RUNTIME_ID", "sandboxIsolationDemo-COIZYqEK2d")
-ACCOUNT = os.environ.get("ACCOUNT_ID", "123456789012")
-RUNTIME_ARN = f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:runtime/{RUNTIME_ID}"
+ACCOUNT = os.environ.get("ACCOUNT_ID")
+# ARN 在 __main__ 里填。账号不设占位符默认值 —— 那会拼出一个语法合法但指向别人
+# 账号的 ARN，失败信息是 AccessDenied，看着像权限问题而不是配置问题。
+RUNTIME_ARN = None
 
 SECRET_ID = os.environ.get("TENANT_SIGNING_KEY_SECRET_ID", "agentcore/tenant-signing-key")
 
@@ -625,6 +627,16 @@ if __name__ == "__main__":
         sys.exit(f"boto3 未安装（当前解释器: {sys.executable}）\n"
                  f"  sudo dnf install -y python3-boto3     # AL2023 / RHEL\n"
                  f"  sudo apt install -y python3-boto3     # Debian / Ubuntu")
+
+    # 账号不给就问 STS 要 —— 反正调 Runtime 也得用这份凭证。放在 __main__ 里，
+    # 免得 `unittest discover` 导入本文件时也去打一次 STS。
+    if not ACCOUNT:
+        try:
+            ACCOUNT = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
+        except Exception as e:
+            sys.exit(f"无法确定 AWS 账号 id: {type(e).__name__}: {str(e)[:200]}\n"
+                     f"配好 AWS 凭证，或 export ACCOUNT_ID=<12 位账号 id>")
+    RUNTIME_ARN = f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:runtime/{RUNTIME_ID}"
 
     SIGNING_KEY, KEY_SOURCE = load_signing_key()
     if not SIGNING_KEY:

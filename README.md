@@ -278,7 +278,6 @@ python3 -m venv ~/.venv/agentcore && ~/.venv/agentcore/bin/pip install boto3
 
 ```bash
 export RUNTIME_ID=sandboxIsolationDemo-xxxx AWS_REGION=us-east-1
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 ./tools/tenant_shell.py --tenant tenant-a           # 交互式
 ./tools/tenant_shell.py --tenant tenant-a --probe   # 一键隔离探测（13 项）
@@ -286,7 +285,8 @@ export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ```
 
 还需要一份能 `bedrock-agentcore:InvokeAgentRuntime` 的 AWS 凭证，以及签名密钥
-（未设 `TENANT_SIGNING_KEY` 时会自动从 Secrets Manager 取，见下）。
+（未设 `TENANT_SIGNING_KEY` 时会自动从 Secrets Manager 取，见下）。账号 id 不用
+自己导出 —— 未设 `ACCOUNT_ID` 时脚本会用当前 AWS 身份所属账号拼 ARN。
 
 指定 runtime 与 session：
 
@@ -294,7 +294,7 @@ export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 |------|---------|------|
 | `--runtime-arn` | `RUNTIME_ARN` | 完整 ARN，给了就忽略下面两项 |
 | `--runtime-id` | `RUNTIME_ID` | 与 `--account`/`--region` 拼成 ARN |
-| `--account` / `--region` | `ACCOUNT_ID` / `AWS_REGION` | |
+| `--account` / `--region` | `ACCOUNT_ID` / `AWS_REGION` | 账号不给就取当前 AWS 身份所属账号 |
 | `--session-id` | `RUNTIME_SESSION_ID` | 复用已有 session；不足 33 字符自动补齐 |
 | `--secret-id` | `TENANT_SIGNING_KEY_SECRET_ID` | 签名密钥的 secret |
 | `--tenant` `--timeout` `-c` `--probe` `--no-sign` `--keep-session` | | |
